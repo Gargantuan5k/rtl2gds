@@ -1,0 +1,30 @@
+# Vivado project files
+rtl2gds_vivado/
+
+# Rendered PDF images
+*.png
+
+# Claude Code local settings
+.claude/
+
+# Vivado generated files
+*.jou
+*.log
+*.str
+*.xpr
+*.bit
+*.ltx
+*.runs/
+*.cache/
+*.hw/
+*.ip_user_files/
+*.sim/
+*.srcs/
+*.gen/
+
+# Common build artifacts
+*.o
+*.so
+*.vcd
+*.wdb
+*.wcfg
