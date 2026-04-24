@@ -1,6 +1,9 @@
 # Vivado project files
 rtl2gds_vivado/
 
+# Personal study notes
+docs/CODE_EXPLAINED.md
+
 # Rendered PDF images
 *.png
 

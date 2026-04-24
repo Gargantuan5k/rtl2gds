@@ -10,11 +10,11 @@
 module booth_multiplier (
     input  wire        clk,
     input  wire        rst_n,
-    input  wire        valid_in,
-    input  wire signed [15:0] a,        // multiplicand
+    input  wire        valid_in, // handshake to check if the input that we receive HAS to be processed or not (there may be garbage data in a real system due to various factors)
+    input  wire signed [15:0] a,        // multiplicand 
     input  wire signed [15:0] b,        // multiplier
     output reg  signed [31:0] product,
-    output reg               valid_out
+    output reg               valid_out // mirrors valid_in but delayed by one cycle, handshake to verify that the output is correct
 );
 
     integer i;
