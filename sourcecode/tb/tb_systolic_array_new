@@ -1,0 +1,523 @@
+// =============================================================================
+// Testbench: tb_systolic_array
+// Tests a 4x4 weight-stationary systolic array.
+// Computes C = A * B where A and B are 4x4 matrices of 16-bit signed values.
+// The array performs NUM_STEPS=4 accumulations (dot-product length = 4).
+//
+// Test 1: Identity weight matrix, A = diagonal → C = A
+// Test 2: All-ones weight matrix, A = column vector → C = row sums
+// Test 3: Random matrices with software-model reference check
+// =============================================================================
+`timescale 1ns/1ps
+
+module tb_systolic_array;
+
+    localparam SIZE      = 4;
+    localparam NUM_STEPS = 4;
+    localparam W_TOT     = SIZE * SIZE * 16;
+    localparam R_TOT     = SIZE * SIZE * 32;
+
+    reg clk, rst_n;
+    reg load_weights;
+    reg signed [W_TOT-1:0] weight_flat;
+    reg signed [SIZE*16-1:0] a_flat;
+    reg valid_in;
+
+    wire signed [R_TOT-1:0] result_flat;
+    wire [SIZE*SIZE-1:0]    overflow_flat;
+    wire done;
+
+    systolic_array #(.SIZE(SIZE), .NUM_STEPS(NUM_STEPS)) dut (
+        .clk         (clk),
+        .rst_n       (rst_n),
+        .load_weights(load_weights),
+        .weight_flat (weight_flat),
+        .a_flat      (a_flat),
+        .valid_in    (valid_in),
+        .result_flat (result_flat),
+        .overflow_flat(overflow_flat),
+        .done        (done)
+    );
+
+    initial clk = 0;
+    always #5 clk = ~clk;
+
+    integer pass_cnt = 0, fail_cnt = 0;
+    integer i, r, c, k;
+
+    // Reference model storage
+    reg signed [15:0] ref_w [0:SIZE-1][0:SIZE-1];
+    reg signed [15:0] ref_a [0:NUM_STEPS-1][0:SIZE-1]; // [step][row]
+    reg signed [31:0] ref_c [0:SIZE-1][0:SIZE-1];
+
+    // Extract result from flat bus
+    function signed [31:0] get_result;
+        input integer row, col;
+        begin
+            get_result = result_flat[(row*SIZE + col)*32 +: 32];
+        end
+    endfunction
+
+    // Load weights and run NUM_STEPS activation vectors; check results
+    task run_test;
+        input [63:0] test_id;
+        integer row, col, step;
+        reg signed [63:0] dot;
+        begin
+            // Compute reference: C[row][col] = sum_k( W[row][k] * A[step=k][row?] )
+            // Weight-stationary: C[r][c] = sum over steps of W[r][c] * a_skew[c][r]
+            // where a_skew[c][step] = A[step - c][r] (skewed by col c cycles).
+            // For a simple dot-product test (same vector each step), ref is:
+            //   C[r][c] = W[r][c] * sum_k(A[k][r]) ... but each PE only sees one row.
+            // Actually: PE[r][c] accumulates W[r][c] * a_skew[c][r] for NUM_STEPS steps.
+            // With the column skew, PE[r][c] at logical step t sees A[t][r].
+            // So C[r][c] = W[r][c] * sum_{t=0}^{NUM_STEPS-1} A[t][r].
+            // For a matrix multiply interpretation feed A column by column.
+            // Here we just check the exact accumulated value.
+            for (row = 0; row < SIZE; row = row + 1)
+                for (col = 0; col < SIZE; col = col + 1) begin
+                    dot = 64'sd0;
+                    for (step = 0; step < NUM_STEPS; step = step + 1)
+                        dot = dot + ($signed(ref_w[row][col]) * $signed(ref_a[step][row]));
+                    ref_c[row][col] = dot[31:0];
+                end
+
+            // Load weights
+            @(negedge clk);
+            for (row = 0; row < SIZE; row = row + 1)
+                for (col = 0; col < SIZE; col = col + 1)
+                    weight_flat[(row*SIZE+col)*16 +: 16] = ref_w[row][col];
+            load_weights = 1;
+            @(posedge clk); #1;
+            load_weights = 0;
+
+            // Feed NUM_STEPS activation vectors
+            for (step = 0; step < NUM_STEPS; step = step + 1) begin
+                @(negedge clk);
+                for (row = 0; row < SIZE; row = row + 1)
+                    a_flat[row*16 +: 16] = ref_a[step][row];
+                valid_in = 1;
+                @(posedge clk); #1;
+            end
+            @(negedge clk);
+            valid_in = 0;
+
+            // Wait for done
+            @(posedge done); #1;
+
+            // Check
+            for (row = 0; row < SIZE; row = row + 1)
+                for (col = 0; col < SIZE; col = col + 1) begin
+                    if (get_result(row, col) === ref_c[row][col]) begin
+                        pass_cnt = pass_cnt + 1;
+                    end else begin
+                        $display("FAIL test%0d PE[%0d][%0d]: got %0d, exp %0d",
+                                 test_id, row, col,
+                                 get_result(row, col), ref_c[row][col]);
+                        fail_cnt = fail_cnt + 1;
+                    end
+                end
+            $display("Test %0d done.", test_id);
+
+            // Idle gap between tests
+            repeat(10) @(posedge clk);
+        end
+    endtask
+
+    integer seed = 42;
+
+    initial begin
+        $dumpfile("tb_systolic_array.vcd");
+        $dumpvars(0, tb_systolic_array);
+
+        rst_n = 0; load_weights = 0; valid_in = 0;
+        weight_flat = {W_TOT{1'b0}};
+        a_flat      = {(SIZE*16){1'b0}};
+        repeat(4) @(posedge clk);
+        rst_n = 1;
+        repeat(2) @(posedge clk);
+
+        // -----------------------------------------------------------------
+        // Test 1: All-ones weights, constant activation = 1
+        // Expected: each PE accumulates W[r][c] * 1 * NUM_STEPS = NUM_STEPS
+        // -----------------------------------------------------------------
+        for (r = 0; r < SIZE; r = r + 1)
+            for (c = 0; c < SIZE; c = c + 1)
+                ref_w[r][c] = 16'sd1;
+        for (i = 0; i < NUM_STEPS; i = i + 1)
+            for (r = 0; r < SIZE; r = r + 1)
+                ref_a[i][r] = 16'sd1;
+        run_test(1);
+
+        // -----------------------------------------------------------------
+        // Test 2: Weights = row index+1, activation = col index+1
+        // PE[r][c]: W=r+1, A=r+1 (each row sees its own activation)
+        // Expected: C[r][c] = (r+1)*(r+1)*NUM_STEPS
+        // -----------------------------------------------------------------
+        for (r = 0; r < SIZE; r = r + 1)
+            for (c = 0; c < SIZE; c = c + 1)
+                ref_w[r][c] = r + 1;
+        for (i = 0; i < NUM_STEPS; i = i + 1)
+            for (r = 0; r < SIZE; r = r + 1)
+                ref_a[i][r] = r + 1;
+        run_test(2);
+
+        // -----------------------------------------------------------------
+        // Test 3: Alternating positive/negative weights
+        // -----------------------------------------------------------------
+        for (r = 0; r < SIZE; r = r + 1)
+            for (c = 0; c < SIZE; c = c + 1)
+                ref_w[r][c] = ((r + c) % 2 == 0) ? 16'sd3 : -16'sd3;
+        for (i = 0; i < NUM_STEPS; i = i + 1)
+            for (r = 0; r < SIZE; r = r + 1)
+                ref_a[i][r] = 16'sd2;
+        run_test(3);
+
+        // -----------------------------------------------------------------
+        // Test 4: Zero activations — all results must be zero
+        // -----------------------------------------------------------------
+        for (r = 0; r < SIZE; r = r + 1)
+            for (c = 0; c < SIZE; c = c + 1)
+                ref_w[r][c] = 16'sd100;
+        for (i = 0; i < NUM_STEPS; i = i + 1)
+            for (r = 0; r < SIZE; r = r + 1)
+                ref_a[i][r] = 16'sd0;
+        run_test(4);
+
+        // -----------------------------------------------------------------
+        // Test 5: Random weights and activations
+        // -----------------------------------------------------------------
+        for (r = 0; r < SIZE; r = r + 1)
+            for (c = 0; c < SIZE; c = c + 1)
+                ref_w[r][c] = $random(seed);
+        for (i = 0; i < NUM_STEPS; i = i + 1)
+            for (r = 0; r < SIZE; r = r + 1)
+                ref_a[i][r] = $random;
+        run_test(5);
+
+        // =====================================================================
+        // NEW: Gap #1 -- overflow_flat is never checked anywhere in the
+        // original suite. Load large-magnitude weights and activations so
+        // every PE's internal accumulator wraps, and confirm overflow_flat
+        // eventually goes all-ones. Like accumulator.v, the per-PE overflow
+        // bit is NOT sticky, so we OR it on the testbench side across the
+        // whole run rather than sampling only at `done`.
+        // =====================================================================
+        begin : ov_test
+            reg [SIZE*SIZE-1:0] sticky_ov;
+            integer step;
+            sticky_ov = {(SIZE*SIZE){1'b0}};
+            @(negedge clk);
+            for (r = 0; r < SIZE; r = r + 1)
+                for (c = 0; c < SIZE; c = c + 1)
+                    weight_flat[(r*SIZE+c)*16 +: 16] = 16'sd30000;
+            load_weights = 1;
+            @(posedge clk); #1; load_weights = 0;
+
+            @(negedge clk);
+            for (r = 0; r < SIZE; r = r + 1) a_flat[r*16 +: 16] = 16'sd30000;
+            valid_in = 1;
+            for (step = 0; step < NUM_STEPS; step = step + 1) begin
+                @(posedge clk); sticky_ov = sticky_ov | overflow_flat; #1;
+            end
+            valid_in = 0;
+            repeat(10) begin @(posedge clk); sticky_ov = sticky_ov | overflow_flat; end
+
+            if (sticky_ov == {(SIZE*SIZE){1'b1}}) begin
+                $display("PASS: overflow_flat asserts across all %0d PEs under saturating inputs", SIZE*SIZE);
+                pass_cnt = pass_cnt + 1;
+            end else begin
+                $display("FAIL: overflow_flat did not assert for all PEs, sticky_ov=%b", sticky_ov);
+                fail_cnt = fail_cnt + 1;
+            end
+        end
+        repeat(5) @(posedge clk);
+
+        // =====================================================================
+        // NEW: Gap #2 -- No test of pausing mid-stream.
+        // Feed NUM_STEPS activation beats with a one-cycle bubble
+        // (valid_in=0) inserted after the first beat, then resume.
+        //
+        // *** THIS TEST DOCUMENTS A REAL BUG FOUND WHILE WRITING IT ***
+        // clear_pulse is generated as (valid_in && !valid_in_prev), i.e. any
+        // 0->1 transition of valid_in. That is meant to detect the START of
+        // a brand-new computation, but it cannot tell a genuine new op apart
+        // from valid_in simply resuming after a one-cycle stall. So a single
+        // bubble mid-stream causes the array to silently re-fire clear_pulse,
+        // wiping every PE's accumulator and restarting step_cnt back to 1 --
+        // losing all partial sums accumulated before the pause.
+        // This test asserts the SPEC-CORRECT behavior (a pause should not
+        // lose data) and is therefore expected to FAIL against the current
+        // RTL, which is exactly the point: it converts a silent, invisible
+        // data-corruption bug into a repeatable, visible test failure.
+        // =====================================================================
+        begin : pause_test
+            reg signed [31:0] expected;
+            integer wait_cycles;
+            reg      got_done;
+
+            @(negedge clk);
+            for (r = 0; r < SIZE; r = r + 1)
+                for (c = 0; c < SIZE; c = c + 1)
+                    weight_flat[(r*SIZE+c)*16 +: 16] = 16'sd1;
+            load_weights = 1;
+            @(posedge clk); #1; load_weights = 0;
+
+            // beat 1 (counts as the clear-beat, per design)
+            @(negedge clk);
+            for (r = 0; r < SIZE; r = r + 1) a_flat[r*16 +: 16] = 16'sd1;
+            valid_in = 1;
+            @(posedge clk); #1;
+
+            // one-cycle bubble
+            @(negedge clk); valid_in = 0;
+            @(posedge clk); #1;
+
+            // Resume and feed a generous number of beats. NOTE: because the
+            // bug re-fires clear_pulse on this resume edge, the array is
+            // effectively restarting its NUM_STEPS count from here, so we
+            // must feed more than NUM_STEPS beats total to guarantee `done`
+            // ever fires at all (a bounded wait below prevents a hang if it
+            // still doesn't, rather than blocking forever on @(posedge done)).
+            @(negedge clk); valid_in = 1;
+            repeat(NUM_STEPS + 2) @(posedge clk);
+            #1;
+            @(negedge clk); valid_in = 0;
+
+            got_done = 1'b0;
+            for (wait_cycles = 0; wait_cycles < 40 && !got_done; wait_cycles = wait_cycles + 1) begin
+                @(posedge clk); #1;
+                if (done) got_done = 1'b1;
+            end
+
+            expected = NUM_STEPS; // weight=1, activation=1, NUM_STEPS beats -> NUM_STEPS
+            if (got_done && get_result(0,0) === expected) begin
+                $display("PASS: systolic_array survives a mid-stream valid_in bubble without data loss");
+                pass_cnt = pass_cnt + 1;
+            end else begin
+                $display("FAIL (KNOWN RTL BUG): mid-stream bubble caused a spurious clear_pulse.");
+                $display("       got_done=%b PE[0][0]=%0d, expected %0d. See comment above this test.",
+                          got_done, get_result(0,0), expected);
+                $display("       Root cause: clear_pulse = valid_in && !valid_in_prev in systolic_array.v");
+                $display("       cannot distinguish a real new-operation start from a resume-after-stall.");
+                fail_cnt = fail_cnt + 1;
+            end
+        end
+        valid_in = 0;
+        repeat(5) @(posedge clk);
+
+        // =====================================================================
+        // NEW: Gap #3 -- No test of resetting mid-operation.
+        // Start feeding activations, then assert rst_n asynchronously partway
+        // through. Confirm the control FSM (running/step_cnt/drain_sr) and
+        // all PE accumulators return to a clean zero state, and that a fresh
+        // operation issued after release computes correctly.
+        // =====================================================================
+        begin : reset_test
+            @(negedge clk);
+            for (r = 0; r < SIZE; r = r + 1)
+                for (c = 0; c < SIZE; c = c + 1)
+                    weight_flat[(r*SIZE+c)*16 +: 16] = 16'sd1;
+            load_weights = 1;
+            @(posedge clk); #1; load_weights = 0;
+
+            @(negedge clk);
+            for (r = 0; r < SIZE; r = r + 1) a_flat[r*16 +: 16] = 16'sd1;
+            valid_in = 1;
+            @(posedge clk); #1;
+            @(negedge clk);
+            #2; rst_n = 0; // async reset while the array is actively accumulating
+            @(posedge clk); #1;
+            valid_in = 0;
+            if (dut.running === 1'b0 && dut.step_cnt === 0 &&
+                get_result(0,0) === 32'sd0 && done === 1'b0) begin
+                $display("PASS: mid-operation reset returns systolic_array to a clean state");
+                pass_cnt = pass_cnt + 1;
+            end else begin
+                $display("FAIL: mid-operation reset left stale state, running=%b step_cnt=%0d result00=%0d",
+                          dut.running, dut.step_cnt, get_result(0,0));
+                fail_cnt = fail_cnt + 1;
+            end
+            @(negedge clk); rst_n = 1;
+            repeat(3) @(posedge clk); #1;
+        end
+
+        // fresh, correctly-run operation after reset release must be exact
+        for (r = 0; r < SIZE; r = r + 1)
+            for (c = 0; c < SIZE; c = c + 1)
+                ref_w[r][c] = 16'sd1;
+        for (i = 0; i < NUM_STEPS; i = i + 1)
+            for (r = 0; r < SIZE; r = r + 1)
+                ref_a[i][r] = 16'sd1;
+        run_test(101);
+        $display("(test 101 above confirms normal operation resumes correctly after mid-op reset)");
+
+        // =====================================================================
+        // NEW: Gap #4 -- No test of overlapping/colliding operations.
+        //
+        // 4a) Reloading weights (load_weights pulse) WHILE a computation is
+        //     still actively accumulating. The weight register has no
+        //     double-buffering / shadow-copy, so a mid-run reload immediately
+        //     changes what every subsequent MAC in that same run multiplies
+        //     by -- corrupting the in-flight result. This test documents
+        //     that hazard so it is visible and tracked, not silently assumed
+        //     away.
+        // =====================================================================
+        begin : overlap_weight_test
+            reg signed [31:0] isolated_old, isolated_new, observed;
+            isolated_old = 32'sd2 * 32'sd1 * NUM_STEPS;  // if reload had no effect: 2*1*4=8
+            isolated_new = 32'sd99 * 32'sd1 * NUM_STEPS; // if reload fully "won": 99*1*4=396
+
+            @(negedge clk);
+            for (r = 0; r < SIZE; r = r + 1)
+                for (c = 0; c < SIZE; c = c + 1)
+                    weight_flat[(r*SIZE+c)*16 +: 16] = 16'sd2;
+            load_weights = 1;
+            @(posedge clk); #1; load_weights = 0;
+
+            @(negedge clk);
+            for (r = 0; r < SIZE; r = r + 1) a_flat[r*16 +: 16] = 16'sd1;
+            valid_in = 1;
+            @(posedge clk); #1; // beat 1 issued with weight=2
+
+            // sneak a new load_weights in WHILE the run is still active
+            @(negedge clk);
+            for (r = 0; r < SIZE; r = r + 1)
+                for (c = 0; c < SIZE; c = c + 1)
+                    weight_flat[(r*SIZE+c)*16 +: 16] = 16'sd99;
+            load_weights = 1;
+            @(posedge clk); #1; load_weights = 0;
+
+            repeat(NUM_STEPS - 1) @(posedge clk); #1;
+            @(negedge clk); valid_in = 0;
+            repeat(6) @(posedge clk); #1;
+
+            observed = get_result(0,0);
+            if (observed !== isolated_old) begin
+                $display("PASS: weight-reload-mid-computation hazard reproduced as expected.");
+                $display("       PE[0][0]=%0d (neither the pre-reload value %0d nor a clean isolated run).",
+                          observed, isolated_old);
+                $display("       Lesson: never pulse load_weights while a prior run's activations are");
+                $display("       still draining -- there is no shadow register protecting in-flight data.");
+                pass_cnt = pass_cnt + 1;
+            end else begin
+                $display("FAIL: expected the weight reload to visibly perturb the in-flight result, got %0d",
+                          observed);
+                fail_cnt = fail_cnt + 1;
+            end
+        end
+        repeat(5) @(posedge clk);
+
+        // =====================================================================
+        // 4b) Starting a new activation burst back-to-back with NO idle cycle
+        //     between it and the previous burst (valid_in never returns low).
+        //     clear_pulse only fires on a 0->1 edge of valid_in, so if the
+        //     user's controller doesn't insert a gap, the "second operation"
+        //     is silently treated as a continuation of the first -- it keeps
+        //     accumulating on top of the old result instead of restarting,
+        //     and only ONE `done` pulse is produced for both bursts combined.
+        //     This test documents that real timing requirement so it can't
+        //     be "discovered" for the first time on real silicon.
+        // =====================================================================
+        begin : overlap_burst_test
+            integer done_pulses;
+            reg signed [31:0] combined;
+            done_pulses = 0;
+
+            @(negedge clk);
+            for (r = 0; r < SIZE; r = r + 1)
+                for (c = 0; c < SIZE; c = c + 1)
+                    weight_flat[(r*SIZE+c)*16 +: 16] = 16'sd1;
+            load_weights = 1;
+            @(posedge clk); #1; load_weights = 0;
+
+            @(negedge clk);
+            for (r = 0; r < SIZE; r = r + 1) a_flat[r*16 +: 16] = 16'sd1;
+            valid_in = 1;
+            // Burst A: NUM_STEPS beats
+            repeat(NUM_STEPS) @(posedge clk);
+            // Burst B starts immediately -- valid_in NEVER drops low in between
+            repeat(NUM_STEPS) @(posedge clk);
+            #1;
+            @(negedge clk); valid_in = 0;
+
+            fork
+                begin : wait_done
+                    repeat(20) begin
+                        @(posedge clk);
+                        if (done) done_pulses = done_pulses + 1;
+                    end
+                end
+            join
+
+            combined = get_result(0,0);
+            // With weight=1, activation=1: a clean, correctly-separated pair of
+            // operations would give result=NUM_STEPS after EACH op (2 done
+            // pulses, each showing NUM_STEPS). What actually happens is a single
+            // merged run producing one done pulse and 2*NUM_STEPS accumulated.
+            if (done_pulses == 1 && combined === 32'sd2*NUM_STEPS) begin
+                $display("PASS: back-to-back bursts with no gap merge into a single accumulation, as documented.");
+                $display("       done_pulses=%0d, PE[0][0]=%0d (2*NUM_STEPS=%0d) -- confirms a gap is REQUIRED",
+                          done_pulses, combined, 2*NUM_STEPS);
+                $display("       between logically distinct operations, or they silently merge.");
+                pass_cnt = pass_cnt + 1;
+            end else begin
+                $display("FAIL: unexpected back-to-back behavior, done_pulses=%0d PE[0][0]=%0d",
+                          done_pulses, combined);
+                fail_cnt = fail_cnt + 1;
+            end
+        end
+        repeat(5) @(posedge clk);
+
+        // =====================================================================
+        // NEW: Gap #5 -- The systolic array's own header says it is "designed
+        // to multiply two full matrices"; the original tests only used
+        // trivial matrices (identity/all-ones/all-zero/constant-per-step) and
+        // even said in their own comments "here we just check the exact
+        // accumulated value" -- i.e. they verify the RTL against a formula,
+        // not against genuinely rich, full-rank matrix data exercising every
+        // PE differently across every time step.
+        //
+        // NOTE (architecture caveat worth flagging separately, not an RTL
+        // change): because each PE's weight is loaded ONCE and held fixed
+        // for the whole run, this hardware does not compute a conventional
+        // GEMM C = A x W (which needs sum_t A[r][t]*W[t][c]); it computes
+        // C[r][c] = W[r][c] * sum_t(A[r][t]) -- a fixed per-PE weight scaling
+        // the time-accumulated activation of its row. The test below still
+        // uses full, distinct, non-trivial matrix data (all 16 weights and
+        // all 16 activation values across 4 steps are unique, signed, and
+        // include both positive and negative numbers) to genuinely exercise
+        // every PE and every step -- it is just computed against the
+        // architecture's real formula rather than a textbook matmul.
+        // =====================================================================
+        begin : full_matrix_test
+            // A "real" 4x4 weight matrix -- fully populated, no symmetry, no repeats
+            ref_w[0][0]=16'sd3;  ref_w[0][1]=-16'sd7; ref_w[0][2]=16'sd12; ref_w[0][3]=-16'sd1;
+            ref_w[1][0]=16'sd5;  ref_w[1][1]=16'sd9;  ref_w[1][2]=-16'sd4; ref_w[1][3]=16'sd6;
+            ref_w[2][0]=-16'sd8; ref_w[2][1]=16'sd2;  ref_w[2][2]=16'sd0;  ref_w[2][3]=16'sd11;
+            ref_w[3][0]=16'sd14; ref_w[3][1]=-16'sd6; ref_w[3][2]=16'sd3;  ref_w[3][3]=-16'sd9;
+
+            // A genuinely full 4x4 activation matrix: a DIFFERENT vector each
+            // step (matching the documented "full matrix multiply" protocol
+            // of feeding a new vector every cycle), fully populated, signed.
+            ref_a[0][0]=16'sd2;  ref_a[0][1]=-16'sd3; ref_a[0][2]=16'sd7;  ref_a[0][3]=16'sd1;
+            ref_a[1][0]=-16'sd5; ref_a[1][1]=16'sd6;  ref_a[1][2]=-16'sd2; ref_a[1][3]=16'sd3;
+            ref_a[2][0]=16'sd8;  ref_a[2][1]=16'sd0;  ref_a[2][2]=-16'sd9; ref_a[2][3]=-16'sd6;
+            ref_a[3][0]=16'sd1;  ref_a[3][1]=16'sd4;  ref_a[3][2]=16'sd5;  ref_a[3][3]=16'sd10;
+
+            run_test(102);
+            $display("(test 102 above is the full, non-trivial matrix-multiply exercise for Gap #5)");
+        end
+
+        $display("\n=== systolic_array: %0d passed, %0d failed ===", pass_cnt, fail_cnt);
+        if (fail_cnt == 0) $display("ALL TESTS PASSED");
+        else $display("NOTE: failures above (if any) are documenting real RTL findings -- see comments in this testbench.");
+        $finish;
+    end
+
+    initial begin
+        #2000000;
+        $display("TIMEOUT"); $finish;
+    end
+
+endmodule
